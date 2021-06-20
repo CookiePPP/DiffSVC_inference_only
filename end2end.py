@@ -287,4 +287,5 @@ def test_wav():# test the model with data computed from the functions above
             print(f"Wrote audio to '{outpath}'\nTook {time.time()-start_time:.2f} seconds")
             print("")
 
-test_wav()
+if __name__ == "__main__":
+    test_wav()
