@@ -68,9 +68,11 @@ def check_hparams_match(diffsvc_config, dilated_asr_config, hifigan_config):
 
 def load_e2e_diffsvc(diffsvc_path, dilated_asr_path, hifigan_path, device='cuda'):
     diffsvc   , diffsvc_config    , speakerlist, spkr_f0, spkr_sylps = load_diffsvc_from_path    (diffsvc_path    , device=device)
-    dilatedasr, dilated_asr_config, speakerlist                      = load_dilated_asr_from_path(dilated_asr_path, device=device)
+    dilatedasr, dilated_asr_config, _                                = load_dilated_asr_from_path(dilated_asr_path, device=device)
     hifigan   , hifigan_config                                       = load_hifigan_ct_from_path (hifigan_path    , device=device)
     check_hparams_match(diffsvc_config, dilated_asr_config, hifigan_config)
+    
+    speakerlist = [[dataset,name,id,source,source_type,duration] for dataset,name,id,source,source_type,duration in speakerlist if id in spkr_f0.keys()]
     
     stft = get_stft(diffsvc_config)
     
@@ -179,33 +181,34 @@ def endtoend_from_cache(diffsvc, dilatedasr, hifigan, stft, config, speakerlist,
 @torch.no_grad()
 def endtoend(diffsvc, dilatedasr, hifigan, stft, config, speakerlist, spkr_f0, spkr_sylps,
              audio, target_speaker, correct_pitch, t_step_size=1, t_max_step=None, gt_mel=None, frame_ppg=None, gt_frame_logf0=None):# only supports a single audio file at a time
+    # get input features for model
     if gt_mel is None or frame_ppg is None:
         gt_mel = get_mel_from_audio(audio, stft, config)# [1, n_mel, mel_T]
     if frame_ppg is None:
         frame_ppg = get_ppg_from_mel(gt_mel, dilatedasr, config)
     if gt_frame_logf0 is None:
         gt_frame_logf0 = get_logf0_from_audio(audio, config).unsqueeze(0)
-    
     mel_lengths = torch.tensor([gt_mel.shape[2],]).long()
     gt_perc_loudness = torch.tensor([config.target_lufs,])
     
+    # get speaker id from fuzzy speaker name
     possible_names = [x[1].lower() for x in speakerlist]
     speaker_lookup = {x[1].lower(): x[2] for x in speakerlist}
-    speaker = difflib.get_close_matches(target_speaker.lower(), possible_names, n=2, cutoff=0.01)[0]# get closest name from target_speaker
+    speaker = difflib.get_close_matches(target_speaker.lower(), possible_names, n=2, cutoff=0.2)[0]# get closest name from target_speaker
     print(f"Selected speaker: {speaker}")
     speaker_id_ext = speaker_lookup[speaker]
     
+    # get internal speaker id and pitch/speed characteristics
     (speaker_id,
      speaker_f0_meanstd,
      speaker_slyps_meanstd) = speaker_id_ext, spkr_f0[speaker_id_ext], spkr_sylps[speaker_id_ext]
     speaker_id = torch.tensor([speaker_id,]).long()
     speaker_f0_meanstd    = torch.tensor([speaker_f0_meanstd,])
     speaker_slyps_meanstd = torch.tensor([speaker_slyps_meanstd,])
-    #print(f"F0 Mean {speaker_f0_meanstd[0, 0].item()} | STD {speaker_f0_meanstd[0, 1].item()}")
-    #print(f"SR Mean {speaker_slyps_meanstd[0, 0].item()} | STD {speaker_slyps_meanstd[0, 1].item()}")
     
+    # (optional) modify pitch to make the speaker sound more like the target
     if correct_pitch:# correct pitch mean
-        correction_shift = speaker_f0_meanstd[:, 0].log()-gt_frame_logf0[gt_frame_logf0!=0.0].float().mean()
+        correction_shift = speaker_f0_meanstd[:, 0].log()-gt_frame_logf0[gt_frame_logf0!=0.0].float().exp().mean().log()
         gt_frame_logf0[gt_frame_logf0!=0.0] += correction_shift
     
     if True:# correct pitch scale
@@ -224,6 +227,7 @@ def endtoend(diffsvc, dilatedasr, hifigan, stft, config, speakerlist, spkr_f0, s
     speaker_f0_meanstd    = speaker_f0_meanstd   .to(diffsvc_device, diff_dtype)
     speaker_slyps_meanstd = speaker_slyps_meanstd.to(diffsvc_device, diff_dtype)
     
+    # run DiffSVC over inputs to get spectrogram
     pred_mel = diffsvc.generator.voice_conversion_main(
                        gt_mel,  mel_lengths,# FloatTensor[B, n_mel, mel_T], LongTensor[B] # take from reference/source
                            gt_perc_loudness,# FloatTensor[B]                              # take from reference/source
@@ -235,6 +239,7 @@ def endtoend(diffsvc, dilatedasr, hifigan, stft, config, speakerlist, spkr_f0, s
                               t_step_size=t_step_size,# int
                                t_max_step=t_max_step).transpose(1, 2)# -> [B, n_mel, mel_T]
     
+    # run HiFi-GAN over spectrogram to get audio
     hifigan_device, hifigan_dtype = next(hifigan.parameters()).device, next(hifigan.parameters()).dtype
     pred_audio = hifigan(pred_mel.to(hifigan_device, hifigan_dtype))
     
@@ -247,7 +252,7 @@ def test_wav():# test the model with data computed from the functions above
     outdir = "/media/cookie/Samsung 860 QVO/TTS/"
     audiopath = "/media/cookie/Samsung 860 QVO/TTS/voiceline_2.wav"
     
-    target_speakers = ['Twilight','Pinkie','Discord','Nancy','Yosuke','Adachi']
+    target_speakers = ['ryuji','Twilight','Pinkie','Discord','Nancy','Yosuke','Adachi']
     correct_pitch = True
     device = 'cpu'
     
@@ -260,7 +265,7 @@ def test_wav():# test the model with data computed from the functions above
     
     lin_start   = 1e-4                                    # default 1e-4
     lin_end     = 0.24# modify for more strength per step # default 0.06
-    lin_n_steps = 100 # modify for more steps             # default 100
+    lin_n_steps = 200 # modify for more steps             # default 100
     diffsvc.generator.diffusion.set_noise_schedule(lin_start, lin_end, lin_n_steps, device=device)
     
     for target_speaker in target_speakers:
@@ -268,8 +273,9 @@ def test_wav():# test the model with data computed from the functions above
             pred_audio = endtoend_from_path(diffsvc, dilatedasr, hifigan, stft, diffsvc_config, speakerlist, spkr_f0, spkr_sylps,
                                             audiopath, target_speaker, correct_pitch, t_max_step=max_t)
             
-            outpath = f"{outdir}/output_spkr{target_speaker}_max{max_t:04}_step{t_step_size}_{'mod' if correct_pitch else 'orig'}pitch.wav"
+            outpath = f"{outdir}/output_spkr{target_speaker}_max{max_t:04}_{'mod' if correct_pitch else 'orig'}pitch.wav"
             write_to_file(outpath, pred_audio, diffsvc_config.sampling_rate)
             print(f"Wrote audio to '{outpath}'")
+            print("")
 
 test_wav()
