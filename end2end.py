@@ -165,22 +165,22 @@ def write_to_file(path, audio, sampling_rate):
     write(path, sampling_rate, audio)
 
 def endtoend_from_path(diffsvc, dilatedasr, hifigan, stft, config, speakerlist, spkr_f0, spkr_sylps,
-                       audiopath, target_speaker, correct_pitch, t_step_size=1, t_max_step=None):
+                       audiopath, target_speaker, correct_pitch, correct_pitch_logstd, correct_pitch_std, t_step_size=1, t_max_step=None):
     audio = get_audio_from_path(audiopath, config)
     pred_audio = endtoend(diffsvc, dilatedasr, hifigan, stft, config, speakerlist, spkr_f0, spkr_sylps,
-             audio, target_speaker, correct_pitch, t_step_size=t_step_size, t_max_step=t_max_step)
+             audio, target_speaker, correct_pitch, correct_pitch_logstd, correct_pitch_std, t_step_size=t_step_size, t_max_step=t_max_step)
     return pred_audio
 
 def endtoend_from_cache(diffsvc, dilatedasr, hifigan, stft, config, speakerlist, spkr_f0, spkr_sylps,
-                       audiopath, target_speaker, correct_pitch, t_step_size=1, t_max_step=None):
+                       audiopath, target_speaker, correct_pitch, correct_pitch_logstd, correct_pitch_std, t_step_size=1, t_max_step=None):
     audio = get_audio_from_path(audiopath, config)
     pred_audio = endtoend(diffsvc, dilatedasr, hifigan, stft, config, speakerlist, spkr_f0, spkr_sylps,
-             audio, target_speaker, correct_pitch, t_step_size=t_step_size, t_max_step=t_max_step)
+             audio, target_speaker, correct_pitch, correct_pitch_logstd, correct_pitch_std, t_step_size=t_step_size, t_max_step=t_max_step)
     return pred_audio
 
 @torch.no_grad()
 def endtoend(diffsvc, dilatedasr, hifigan, stft, config, speakerlist, spkr_f0, spkr_sylps,
-             audio, target_speaker, correct_pitch, t_step_size=1, t_max_step=None, gt_mel=None, frame_ppg=None, gt_frame_logf0=None):# only supports a single audio file at a time
+             audio, target_speaker, correct_pitch, correct_pitch_logstd, correct_pitch_std, t_step_size=1, t_max_step=None, gt_mel=None, frame_ppg=None, gt_frame_logf0=None):# only supports a single audio file at a time
     # get input features for model
     if gt_mel is None or frame_ppg is None:
         gt_mel = get_mel_from_audio(audio, stft, config)# [1, n_mel, mel_T]
@@ -211,7 +211,13 @@ def endtoend(diffsvc, dilatedasr, hifigan, stft, config, speakerlist, spkr_f0, s
         correction_shift = speaker_f0_meanstd[:, 0].log()-gt_frame_logf0[gt_frame_logf0!=0.0].float().exp().mean().log()
         gt_frame_logf0[gt_frame_logf0!=0.0] += correction_shift
     
-    if True:# correct pitch scale
+    if correct_pitch_logstd:# correct log pitch standard deviation
+        target_logstd = (speaker_f0_meanstd[:, 0]+speaker_f0_meanstd[:, 1]).log() - (speaker_f0_meanstd[:, 0]-speaker_f0_meanstd[:, 1]).log()
+        mean, current_logstd = gt_frame_logf0[gt_frame_logf0!=0.0].mean(), gt_frame_logf0[gt_frame_logf0!=0.0].std()
+        correction_scale = target_logstd/current_logstd
+        gt_frame_logf0[gt_frame_logf0!=0.0] = gt_frame_logf0[gt_frame_logf0!=0.0].sub(mean).mul(correction_scale).add(mean)
+    
+    if correct_pitch_std:# correct pitch standard deviation
         correction_scale = speaker_f0_meanstd[:, 1]/gt_frame_logf0[gt_frame_logf0!=0.0].float().exp().std()
         mean = gt_frame_logf0[gt_frame_logf0!=0.0].mean()
         gt_frame_logf0[gt_frame_logf0!=0.0] = gt_frame_logf0[gt_frame_logf0!=0.0].sub(mean).exp().mul(correction_scale).log().add(mean)
@@ -250,10 +256,12 @@ def endtoend(diffsvc, dilatedasr, hifigan, stft, config, speakerlist, spkr_f0, s
 # testing
 def test_wav():# test the model with data computed from the functions above
     outdir = "/media/cookie/Samsung 860 QVO/TTS/"
-    audiopath = "/media/cookie/Samsung 860 QVO/TTS/voiceline_2.wav"
+    audiopath = "/media/cookie/Samsung 860 QVO/TTS/voice_sample.wav"
     
-    target_speakers = ['ryuji','Twilight','Pinkie','Discord','Nancy','Yosuke','Adachi']
+    target_speakers = ['Discord','Twilight','Pinkie','Nancy','Yosuke','Adachi']
     correct_pitch = True
+    correct_pitch_logstd = False
+    correct_pitch_std    = True
     device = 'cpu'
     
     diffsvc, dilatedasr, hifigan, stft, diffsvc_config, speakerlist, spkr_f0, spkr_sylps, = load_e2e_diffsvc(
@@ -270,12 +278,13 @@ def test_wav():# test the model with data computed from the functions above
     
     for target_speaker in target_speakers:
         for max_t in range(0, lin_n_steps+1, lin_n_steps//2):
+            start_time = time.time()
             pred_audio = endtoend_from_path(diffsvc, dilatedasr, hifigan, stft, diffsvc_config, speakerlist, spkr_f0, spkr_sylps,
-                                            audiopath, target_speaker, correct_pitch, t_max_step=max_t)
+                                            audiopath, target_speaker, correct_pitch, correct_pitch_logstd, correct_pitch_std, t_max_step=max_t)
             
             outpath = f"{outdir}/output_spkr{target_speaker}_max{max_t:04}_{'mod' if correct_pitch else 'orig'}pitch.wav"
             write_to_file(outpath, pred_audio, diffsvc_config.sampling_rate)
-            print(f"Wrote audio to '{outpath}'")
+            print(f"Wrote audio to '{outpath}'\nTook {time.time()-start_time:.2f} seconds")
             print("")
 
 test_wav()
